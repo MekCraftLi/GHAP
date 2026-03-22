@@ -207,6 +207,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+    # 将高斯模型返回
+    return gaussians
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -372,7 +374,84 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, compaction)
+    gaussians = training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, compaction)
+
+    #_features_rest是所有的反光特征，形状(N, 15, 3)
+    rest_features = gaussians._features_rest.data
+
+    #计算每个高斯体的45个高阶特征的绝对值总和
+    sh_magnitude = torch.norm(rest_features, dim=(1, 2));
+
+    # sh_magnitude的形状是(N,)，其中每个元素表示对应高斯体的45个高阶特征的绝对值总和
+
+    # 2. 设定阈值，找出最不反光的70%的高斯体
+    threshold = torch.quantile(sh_magnitude, 0.7)
+
+    # 3. 生成布尔掩码：哪些高斯体是"漫反射"的？
+    is_matte_mask = sh_magnitude < threshold
+
+    print(f"总共有 {rest_features.shape[0]} 个点。")
+    print(f"检测到 {is_matte_mask.sum().item()} 个漫反射点，准备裁剪它们的高阶 SH！")
+
+    # 直接把这 70% 漫反射点的高阶 SH 特征强制设为 0.0！
+    gaussians._features_rest.data[is_matte_mask] = 0.0
+    import os
+    import zipfile
+
+    print("\n[保存] 正在将 SH 裁剪后的模型保存至硬盘...")
+
+    # 1. 确定原始模型的路径 (用于对比)
+    original_ply_dir = os.path.join(args.model_path, "point_cloud", f"iteration_{args.iterations}")
+    original_ply_path = os.path.join(original_ply_dir, "point_cloud.ply")
+
+    # 2. 定义新模型的保存路径 (加了 _pruned 后缀)
+    pruned_ply_dir = os.path.join(args.model_path, "point_cloud", f"iteration_{args.iterations}_pruned")
+    os.makedirs(pruned_ply_dir, exist_ok=True)
+    pruned_ply_path = os.path.join(pruned_ply_dir, "point_cloud.ply")
+
+    # 调用模型自带的保存函数
+    gaussians.save_ply(pruned_ply_path)
+
+
+    # 3. 定义 ZIP 压缩辅助函数
+    def zip_file(input_file_path, output_zip_path):
+        with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # arcname 防止把整个绝对路径都压缩进 zip 里
+            zipf.write(input_file_path, arcname="point_cloud.ply")
+        return os.path.getsize(output_zip_path) / (1024 * 1024)  # 返回 MB
+
+
+    print("\n[测试] 正在进行 ZIP 字典极限压缩测试 (这可能需要十几秒，请稍候)...")
+
+    if os.path.exists(original_ply_path):
+        # 压缩原始文件
+        original_zip_path = os.path.join(original_ply_dir, "point_cloud.zip")
+        orig_zip_size = zip_file(original_ply_path, original_zip_path)
+        orig_ply_size = os.path.getsize(original_ply_path) / (1024 * 1024)
+
+        # 压缩裁剪后的文件
+        pruned_zip_path = os.path.join(pruned_ply_dir, "point_cloud_pruned.zip")
+        pruned_zip_size = zip_file(pruned_ply_path, pruned_zip_path)
+        pruned_ply_size = os.path.getsize(pruned_ply_path) / (1024 * 1024)
+
+        # 4. 打印战报
+        print("\n" + "=" * 55)
+        print("📊 【自适应 SH 降维压缩战报 (Adaptive SH Pruning)】")
+        print("=" * 55)
+        print(f"-> [Baseline] 原版模型 PLY 占用: {orig_ply_size:.2f} MB")
+        print(f"-> [Baseline] 原版模型 ZIP 占用: {orig_zip_size:.2f} MB")
+        print("-" * 55)
+        print(f"-> [Ours] 裁剪后模型 PLY 占用: {pruned_ply_size:.2f} MB")
+        print(f"-> [Ours] 裁剪后模型 ZIP 占用: {pruned_zip_size:.2f} MB")
+        print("=" * 55)
+
+        reduction = (1 - pruned_zip_size / orig_zip_size) * 100
+        print(f"🎉 你的策略让传输体积在 GHAP 的基础上，再次额外暴降了: {reduction:.2f}%！")
+        print("=" * 55)
+    else:
+        print(f"⚠️ 未找到原始 PLY 文件 ({original_ply_path})，可能是没有开启保存或迭代次数未到。")
+
+    print("\nTraining & Pruning complete.")
 
     # All done
     print("\nTraining complete.")
