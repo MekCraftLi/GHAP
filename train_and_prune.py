@@ -277,35 +277,26 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
 # TODO: For subsampling in training
 def subsampling(gaussians, ratio, random_seed=42, method='GMR'):
-    if method == 'GMR':
-        gaussian_ = gaussian_model_reduction(gaussians, ratio, random_seed)
-        xyz_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._xyz, "xyz")
-        gaussians._xyz = xyz_tensors["xyz"]
-        f_dc_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._features_dc, "f_dc")
-        gaussians._features_dc = f_dc_tensors["f_dc"]
-        f_rest_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._features_rest, "f_rest")
-        gaussians._features_rest = f_rest_tensors["f_rest"]
-        scaling_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._scaling, "scaling")
-        gaussians._scaling = scaling_tensors["scaling"]
-        rotation_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._rotation, "rotation")
-        gaussians._rotation = rotation_tensors["rotation"]
-        opacity_tensors = gaussians.replace_tensor_to_optimizer(gaussian_._opacity, "opacity")
-        gaussians._opacity = opacity_tensors["opacity"]
-
-        gaussians.xyz_gradient_accum = torch.zeros((gaussian_.get_xyz.shape[0], 1), device="cuda")
-        gaussians.denom = torch.zeros((gaussian_.get_xyz.shape[0], 1), device="cuda")
-        gaussians.max_radii2D = torch.zeros((gaussian_.get_xyz.shape[0]), device="cuda")
-    elif method == 'random':
-        from torch import nn
+    """
+    Foveated Compression:
+    - Core(0~30%): 保留 70% 名额
+    - Mid(30%~70%): 保留 25% 名额
+    - Far(70%~100%): 保留 5% 名额
+    """
+    if method != '2GMR':
+        # 保留原随机分支逻辑（作为回退）
         import numpy as np
-        pass # TODO: write random part.
-        n = gaussians.get_xyz.shape[0]
-        downsample_num = int(n * ratio)
         n_total = gaussians.get_xyz.shape[0]
-        assert downsample_num <= n_total
+        if n_total == 0:
+            return gaussians
+
+        downsample_num = int(ratio) if ratio > 1 else int(n_total * ratio)
+        downsample_num = max(1, min(n_total, downsample_num))
+
         np.random.seed(random_seed)
         keep_indices = np.random.choice(n_total, size=downsample_num, replace=False)
-        keep_indices = torch.from_numpy(keep_indices).to("cuda")
+        keep_indices = torch.from_numpy(keep_indices).to(gaussians.get_xyz.device)
+
         with torch.no_grad():
             new_xyz = gaussians._xyz[keep_indices]
             new_features_dc = gaussians._features_dc[keep_indices]
@@ -313,21 +304,191 @@ def subsampling(gaussians, ratio, random_seed=42, method='GMR'):
             new_scaling = gaussians._scaling[keep_indices]
             new_rotation = gaussians._rotation[keep_indices]
             new_opacity = gaussians._opacity[keep_indices]
-            xyz_tensors = gaussians.replace_tensor_to_optimizer(new_xyz, "xyz")
-            gaussians._xyz = xyz_tensors["xyz"]
-            f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_features_dc, "f_dc")
-            gaussians._features_dc = f_dc_tensors["f_dc"]
-            f_rest_tensors = gaussians.replace_tensor_to_optimizer(new_features_rest, "f_rest")
-            gaussians._features_rest = f_rest_tensors["f_rest"]
-            scaling_tensors = gaussians.replace_tensor_to_optimizer(new_scaling, "scaling")
-            gaussians._scaling = scaling_tensors["scaling"]
-            rotation_tensors = gaussians.replace_tensor_to_optimizer(new_rotation, "rotation")
-            gaussians._rotation = rotation_tensors["rotation"]
-            opacity_tensors = gaussians.replace_tensor_to_optimizer(new_opacity, "opacity")
-            gaussians._opacity = opacity_tensors["opacity"]
-            gaussians.xyz_gradient_accum = torch.zeros((new_xyz.shape[0], 1), device="cuda")
-            gaussians.denom = torch.zeros((new_xyz.shape[0], 1), device="cuda")
-            gaussians.max_radii2D = torch.zeros((new_xyz.shape[0]), device="cuda")
+
+        xyz_tensors = gaussians.replace_tensor_to_optimizer(new_xyz, "xyz")
+        gaussians._xyz = xyz_tensors["xyz"]
+        f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_features_dc, "f_dc")
+        gaussians._features_dc = f_dc_tensors["f_dc"]
+        f_rest_tensors = gaussians.replace_tensor_to_optimizer(new_features_rest, "f_rest")
+        gaussians._features_rest = f_rest_tensors["f_rest"]
+        scaling_tensors = gaussians.replace_tensor_to_optimizer(new_scaling, "scaling")
+        gaussians._scaling = scaling_tensors["scaling"]
+        rotation_tensors = gaussians.replace_tensor_to_optimizer(new_rotation, "rotation")
+        gaussians._rotation = rotation_tensors["rotation"]
+        opacity_tensors = gaussians.replace_tensor_to_optimizer(new_opacity, "opacity")
+        gaussians._opacity = opacity_tensors["opacity"]
+
+        new_n = new_xyz.shape[0]
+        device = gaussians.get_xyz.device
+        gaussians.xyz_gradient_accum = torch.zeros((new_n, 1), device=device)
+        gaussians.denom = torch.zeros((new_n, 1), device=device)
+        gaussians.max_radii2D = torch.zeros((new_n,), device=device)
+        return gaussians
+
+    # -----------------------------
+    # 1) 计算中心与距离
+    # -----------------------------
+    xyz = gaussians.get_xyz
+    device = xyz.device
+    n_total = xyz.shape[0]
+    if n_total == 0:
+        return gaussians
+
+    target_n = int(ratio) if ratio > 1 else int(n_total * ratio)
+    target_n = max(1, min(n_total, target_n))
+
+    center = xyz.mean(dim=0, keepdim=True)  # (1, 3)
+    distances = torch.linalg.norm(xyz - center, dim=1)  # (N,)
+
+    # -----------------------------
+    # 2) 三分区掩码 (Core/Mid/Far)
+    # -----------------------------
+    q30 = torch.quantile(distances, 0.30)
+    q70 = torch.quantile(distances, 0.70)
+
+    core_idx = torch.where(distances <= q30)[0]
+    mid_idx = torch.where((distances > q30) & (distances <= q70))[0]
+    far_idx = torch.where(distances > q70)[0]
+
+    zone_indices = [core_idx, mid_idx, far_idx]
+    zone_weights = [0.70, 0.25, 0.05]  # 不公平配额
+    zone_caps = [int(z.numel()) for z in zone_indices]
+
+    # -----------------------------
+    # 3) 名额分配 + 边界兜底
+    # -----------------------------
+    raw_keep = [target_n * w for w in zone_weights]
+    keep = [min(zone_caps[i], int(raw_keep[i])) for i in range(3)]
+
+    # 若 core 非空且总目标 > 0，尽量保证 core 至少 1 个（强调 ROI）
+    if zone_caps[0] > 0 and target_n > 0 and keep[0] == 0:
+        keep[0] = 1
+
+    # 如果超过目标，优先从 Far -> Mid -> Core 回收
+    excess = sum(keep) - target_n
+    if excess > 0:
+        for i in [2, 1, 0]:
+            # core 的最低保留线：若 core 非空且 target_n>0，保留至少 1
+            floor_i = 1 if (i == 0 and zone_caps[0] > 0 and target_n > 0) else 0
+            removable = max(0, keep[i] - floor_i)
+            delta = min(removable, excess)
+            keep[i] -= delta
+            excess -= delta
+            if excess == 0:
+                break
+
+    # 如果不足目标，优先向 Core -> Mid -> Far 填充
+    residual = target_n - sum(keep)
+    while residual > 0:
+        progressed = False
+        for i in [0, 1, 2]:
+            if keep[i] < zone_caps[i]:
+                keep[i] += 1
+                residual -= 1
+                progressed = True
+                if residual == 0:
+                    break
+        if not progressed:
+            break  # 所有分区都满了，无法继续补
+
+    # -----------------------------
+    # 4) 分区切片 + 分别 GMR
+    # -----------------------------
+    def _build_sub_gaussian(src_g, idx):
+        """按索引构建局部 GaussianModel，供局部 GMR 使用。"""
+        sub_g = GaussianModel(src_g.max_sh_degree, src_g.optimizer_type)
+        sub_g.active_sh_degree = src_g.active_sh_degree
+        with torch.no_grad():
+            sub_g._xyz = torch.nn.Parameter(src_g._xyz[idx].detach().clone().requires_grad_(True))
+            sub_g._features_dc = torch.nn.Parameter(src_g._features_dc[idx].detach().clone().requires_grad_(True))
+            sub_g._features_rest = torch.nn.Parameter(src_g._features_rest[idx].detach().clone().requires_grad_(True))
+            sub_g._scaling = torch.nn.Parameter(src_g._scaling[idx].detach().clone().requires_grad_(True))
+            sub_g._rotation = torch.nn.Parameter(src_g._rotation[idx].detach().clone().requires_grad_(True))
+            sub_g._opacity = torch.nn.Parameter(src_g._opacity[idx].detach().clone().requires_grad_(True))
+        return sub_g
+
+    xyz_parts = []
+    fdc_parts = []
+    frest_parts = []
+    scaling_parts = []
+    rotation_parts = []
+    opacity_parts = []
+
+    # 固定随机种子并给不同分区做轻微偏移，避免三个分区完全同随机流
+    zone_seed_offsets = [0, 101, 202]
+
+    for z_i, idx in enumerate(zone_indices):
+        zone_n = int(idx.numel())
+        keep_n = int(keep[z_i])
+        if zone_n == 0 or keep_n <= 0:
+            continue
+
+        # 不需要压缩：直接保留该分区全部
+        if keep_n >= zone_n:
+            xyz_parts.append(gaussians._xyz[idx].detach().clone())
+            fdc_parts.append(gaussians._features_dc[idx].detach().clone())
+            frest_parts.append(gaussians._features_rest[idx].detach().clone())
+            scaling_parts.append(gaussians._scaling[idx].detach().clone())
+            rotation_parts.append(gaussians._rotation[idx].detach().clone())
+            opacity_parts.append(gaussians._opacity[idx].detach().clone())
+            continue
+
+        local_ratio = float(keep_n) / float(zone_n)
+        local_model = _build_sub_gaussian(gaussians, idx)
+
+        reduced = gaussian_model_reduction(
+            local_model,
+            ratio=local_ratio,
+            random_seed=int(random_seed + zone_seed_offsets[z_i])
+        )
+
+        xyz_parts.append(reduced._xyz.detach())
+        fdc_parts.append(reduced._features_dc.detach())
+        frest_parts.append(reduced._features_rest.detach())
+        scaling_parts.append(reduced._scaling.detach())
+        rotation_parts.append(reduced._rotation.detach())
+        opacity_parts.append(reduced._opacity.detach())
+
+    # 极端兜底：若由于边界导致没有任何分区写入，至少保留一个 core 点
+    if len(xyz_parts) == 0:
+        fallback_idx = core_idx[:1] if core_idx.numel() > 0 else torch.tensor([0], device=device, dtype=torch.long)
+        xyz_parts = [gaussians._xyz[fallback_idx].detach().clone()]
+        fdc_parts = [gaussians._features_dc[fallback_idx].detach().clone()]
+        frest_parts = [gaussians._features_rest[fallback_idx].detach().clone()]
+        scaling_parts = [gaussians._scaling[fallback_idx].detach().clone()]
+        rotation_parts = [gaussians._rotation[fallback_idx].detach().clone()]
+        opacity_parts = [gaussians._opacity[fallback_idx].detach().clone()]
+
+    # -----------------------------
+    # 5) 拼接回全局并替换优化器参数
+    # -----------------------------
+    new_xyz = torch.cat(xyz_parts, dim=0).to(device)
+    new_fdc = torch.cat(fdc_parts, dim=0).to(device)
+    new_frest = torch.cat(frest_parts, dim=0).to(device)
+    new_scaling = torch.cat(scaling_parts, dim=0).to(device)
+    new_rotation = torch.cat(rotation_parts, dim=0).to(device)
+    new_opacity = torch.cat(opacity_parts, dim=0).to(device)
+
+    # 使用原工程的 optimizer 替换接口，内部会包装 nn.Parameter(requires_grad=True)
+    xyz_tensors = gaussians.replace_tensor_to_optimizer(new_xyz, "xyz")
+    gaussians._xyz = xyz_tensors["xyz"]
+    f_dc_tensors = gaussians.replace_tensor_to_optimizer(new_fdc, "f_dc")
+    gaussians._features_dc = f_dc_tensors["f_dc"]
+    f_rest_tensors = gaussians.replace_tensor_to_optimizer(new_frest, "f_rest")
+    gaussians._features_rest = f_rest_tensors["f_rest"]
+    scaling_tensors = gaussians.replace_tensor_to_optimizer(new_scaling, "scaling")
+    gaussians._scaling = scaling_tensors["scaling"]
+    rotation_tensors = gaussians.replace_tensor_to_optimizer(new_rotation, "rotation")
+    gaussians._rotation = rotation_tensors["rotation"]
+    opacity_tensors = gaussians.replace_tensor_to_optimizer(new_opacity, "opacity")
+    gaussians._opacity = opacity_tensors["opacity"]
+
+    # 重置优化器相关统计量
+    new_n = gaussians.get_xyz.shape[0]
+    gaussians.xyz_gradient_accum = torch.zeros((new_n, 1), device=device)
+    gaussians.denom = torch.zeros((new_n, 1), device=device)
+    gaussians.max_radii2D = torch.zeros((new_n,), device=device)
+
     return gaussians
 
 
@@ -405,13 +566,14 @@ if __name__ == "__main__":
     original_ply_path = os.path.join(original_ply_dir, "point_cloud.ply")
 
     # 2. 定义新模型的保存路径 (加了 _pruned 后缀)
-    pruned_ply_dir = os.path.join(args.model_path, "point_cloud", f"iteration_{args.iterations}_pruned")
+    pruned_ply_dir = os.path.join(lp._model_path, "point_cloud", f"iteration_{args.iterations}_pruned")
     os.makedirs(pruned_ply_dir, exist_ok=True)
     pruned_ply_path = os.path.join(pruned_ply_dir, "point_cloud.ply")
 
     # 调用模型自带的保存函数
     gaussians.save_ply(pruned_ply_path)
 
+    print(f"压缩模型保存在了{pruned_ply_path}")
 
     # 3. 定义 ZIP 压缩辅助函数
     def zip_file(input_file_path, output_zip_path):
