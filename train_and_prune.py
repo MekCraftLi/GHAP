@@ -11,6 +11,7 @@
 # from gaussian_splatting_sampler.utils import  RobustAutoSamplingTrigger
 # from gaussian_splatting_sampler.gmm_sampler import gaussian_model_reduction
 from gmm_sampler import gaussian_model_reduction
+from semantic_utils import get_protected_gaussian_mask
 import json
 import time
 import os
@@ -191,7 +192,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if compaction.flag:
                 if iteration in compaction.iter:
                     index = compaction.iter.index(iteration)
-                    gaussians = subsampling(gaussians, compaction.ratio[index], 42, compaction.method)
+                    fg_mask = get_protected_gaussian_mask(
+                        gaussians, scene.getTrainCameras(), dataset.source_path
+                    )
+                    gaussians = semantic_subsampling(
+                        gaussians, fg_mask, compaction.ratio[index], 42, compaction.method
+                    )
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
@@ -326,6 +332,95 @@ def subsampling(gaussians, ratio, random_seed=42, method='GMR'):
             gaussians.xyz_gradient_accum = torch.zeros((new_xyz.shape[0], 1), device="cuda")
             gaussians.denom = torch.zeros((new_xyz.shape[0], 1), device="cuda")
             gaussians.max_radii2D = torch.zeros((new_xyz.shape[0]), device="cuda")
+    return gaussians
+
+
+def semantic_subsampling(gaussians, fg_mask, ratio, random_seed=42, method='GMR'):
+    """Split gaussians by semantic mask, compress only background, then merge back."""
+    n_total = gaussians.get_xyz.shape[0]
+    n_fg = int(fg_mask.sum().item())
+    n_bg = n_total - n_fg
+
+    print(f"[Semantic] foreground: {n_fg}, background: {n_bg}, total: {n_total}")
+
+    # Degenerate cases: fall back to normal subsampling
+    if n_fg == 0 or n_bg == 0:
+        print("[Semantic] Degenerate split — falling back to standard subsampling.")
+        return subsampling(gaussians, ratio, random_seed, method)
+
+    bg_mask = ~fg_mask
+
+    # --- Build a bare GaussianModel for background only ---
+    from scene import GaussianModel
+    bg = GaussianModel(sh_degree=gaussians.max_sh_degree)
+    with torch.no_grad():
+        bg._xyz            = gaussians._xyz[bg_mask].detach().clone()
+        bg._features_dc    = gaussians._features_dc[bg_mask].detach().clone()
+        bg._features_rest  = gaussians._features_rest[bg_mask].detach().clone()
+        bg._scaling        = gaussians._scaling[bg_mask].detach().clone()
+        bg._rotation       = gaussians._rotation[bg_mask].detach().clone()
+        bg._opacity        = gaussians._opacity[bg_mask].detach().clone()
+
+    # --- Compress background ---
+    if method == 'GMR':
+        bg_compressed = gaussian_model_reduction(bg, ratio, random_seed)
+    else:
+        # Random fallback for background
+        n_keep = max(1, int(n_bg * ratio))
+        import numpy as np
+        np.random.seed(random_seed)
+        keep_idx = torch.from_numpy(
+            np.random.choice(n_bg, size=n_keep, replace=False)
+        ).to("cuda")
+        bg_compressed = GaussianModel(sh_degree=gaussians.max_sh_degree)
+        with torch.no_grad():
+            bg_compressed._xyz           = bg._xyz[keep_idx].clone()
+            bg_compressed._features_dc   = bg._features_dc[keep_idx].clone()
+            bg_compressed._features_rest = bg._features_rest[keep_idx].clone()
+            bg_compressed._scaling       = bg._scaling[keep_idx].clone()
+            bg_compressed._rotation      = bg._rotation[keep_idx].clone()
+            bg_compressed._opacity       = bg._opacity[keep_idx].clone()
+    del bg
+    torch.cuda.empty_cache()
+
+    # --- Build merged tensors: foreground (unchanged) + compressed background ---
+    with torch.no_grad():
+        new_xyz = torch.cat([gaussians._xyz[fg_mask].detach(),
+                             bg_compressed._xyz], dim=0)
+        new_f_dc = torch.cat([gaussians._features_dc[fg_mask].detach(),
+                              bg_compressed._features_dc], dim=0)
+        new_f_rest = torch.cat([gaussians._features_rest[fg_mask].detach(),
+                                bg_compressed._features_rest], dim=0)
+        new_scaling = torch.cat([gaussians._scaling[fg_mask].detach(),
+                                 bg_compressed._scaling], dim=0)
+        new_rotation = torch.cat([gaussians._rotation[fg_mask].detach(),
+                                  bg_compressed._rotation], dim=0)
+        new_opacity = torch.cat([gaussians._opacity[fg_mask].detach(),
+                                 bg_compressed._opacity], dim=0)
+    del bg_compressed
+    torch.cuda.empty_cache()
+
+    n_merged = new_xyz.shape[0]
+    print(f"[Semantic] merged gaussians: {n_merged} (fg={n_fg} + compressed_bg={n_merged - n_fg})")
+
+    # --- Write merged tensors back into gaussians via optimizer-aware replace ---
+    xyz_t     = gaussians.replace_tensor_to_optimizer(new_xyz,     "xyz")
+    gaussians._xyz = xyz_t["xyz"]
+    f_dc_t    = gaussians.replace_tensor_to_optimizer(new_f_dc,    "f_dc")
+    gaussians._features_dc = f_dc_t["f_dc"]
+    f_rest_t  = gaussians.replace_tensor_to_optimizer(new_f_rest,  "f_rest")
+    gaussians._features_rest = f_rest_t["f_rest"]
+    scl_t     = gaussians.replace_tensor_to_optimizer(new_scaling,  "scaling")
+    gaussians._scaling = scl_t["scaling"]
+    rot_t     = gaussians.replace_tensor_to_optimizer(new_rotation,  "rotation")
+    gaussians._rotation = rot_t["rotation"]
+    opc_t     = gaussians.replace_tensor_to_optimizer(new_opacity,  "opacity")
+    gaussians._opacity = opc_t["opacity"]
+
+    gaussians.xyz_gradient_accum = torch.zeros((n_merged, 1), device="cuda")
+    gaussians.denom              = torch.zeros((n_merged, 1), device="cuda")
+    gaussians.max_radii2D        = torch.zeros((n_merged,),   device="cuda")
+
     return gaussians
 
 
