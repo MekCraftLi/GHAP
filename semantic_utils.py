@@ -48,7 +48,7 @@ def get_protected_gaussian_mask(
     loaded_masks_count = 0
 
     for cam in cameras:
-        mask_path = mask_dir / (cam.image_name + ".png")
+        mask_path = mask_dir / (cam.image_name.split('.')[0] + ".png")
         if not mask_path.exists():
             continue
 
