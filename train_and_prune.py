@@ -484,8 +484,8 @@ def semantic_subsampling(gaussians, fg_mask, ratio, random_seed=42, method='GMR'
                 del gaussians.optimizer.state[old_param]
                 gaussians.optimizer.state[new_param] = new_state
             else:
-                del gaussians.optimizer.state[old_param] if old_param in gaussians.optimizer.state else None
-
+                if old_param in gaussians.optimizer.state:
+                    del gaussians.optimizer.state[old_param]
             return {name: new_param}
         return {}
 
