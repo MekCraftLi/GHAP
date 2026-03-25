@@ -16,6 +16,7 @@ import json
 import time
 import os
 import torch
+import torch.nn as nn
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -104,6 +105,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # else:
         #     gaussians.update_learning_rate(iteration, True)
         gaussians.update_learning_rate(iteration, False)
+        # Restore scaling lr after freeze window
+        if '_scaling_freeze_until' in dir() and iteration == _scaling_freeze_until:
+            for _pg in gaussians.optimizer.param_groups:
+                if _pg["name"] == "scaling":
+                    _pg["lr"] = _scaling_lr_saved
+                    print(f"[Semantic] Scaling lr restored to {_scaling_lr_saved:.6f} at iter {iteration}")
+                    break
         ######################
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -223,6 +231,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians = semantic_subsampling(
                         gaussians, fg_mask, compaction.ratio[index], 42, compaction.method
                     )
+                    # Freeze scaling lr for 100 steps to let optimizer settle
+                    _scaling_freeze_until = iteration + 100
+                    for _pg in gaussians.optimizer.param_groups:
+                        if _pg["name"] == "scaling":
+                            _scaling_lr_saved = _pg["lr"]
+                            _pg["lr"] = 0.0
+                            break
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
@@ -428,18 +443,63 @@ def semantic_subsampling(gaussians, fg_mask, ratio, random_seed=42, method='GMR'
     n_merged = new_xyz.shape[0]
     print(f"[Semantic] merged gaussians: {n_merged} (fg={n_fg} + compressed_bg={n_merged - n_fg})")
 
-    # --- Write merged tensors back into gaussians via optimizer-aware replace ---
-    xyz_t     = gaussians.replace_tensor_to_optimizer(new_xyz,     "xyz")
+    # --- Write merged tensors back into gaussians with correct Adam momentum ---
+    # replace_tensor_to_optimizer zeros out exp_avg/exp_avg_sq, which causes
+    # the optimizer to treat every merged point as brand-new and can cause
+    # transient gradient explosions. Instead, we manually stitch the momentum
+    # states: carry over foreground momentums and zero-init background ones.
+    n_fg_merged = fg_mask.sum().item()
+    with torch.no_grad():
+        # Clamp background scaling to prevent runaway stretching after compression
+        _max_scale = gaussians._scaling[fg_mask].max().detach()
+        new_scaling[n_fg_merged:] = torch.clamp(new_scaling[n_fg_merged:], max=_max_scale)
+
+    def _merge_tensor_with_momentum(new_tensor, name, n_fg_pts):
+        """Replace param in optimizer, stitching fg momentum + zero-init bg momentum."""
+        for group in gaussians.optimizer.param_groups:
+            if group["name"] != name:
+                continue
+            old_param = group['params'][0]
+            stored_state = gaussians.optimizer.state.get(old_param, None)
+
+            new_param = nn.Parameter(new_tensor.requires_grad_(True))
+            group['params'][0] = new_param
+
+            if stored_state is not None:
+                old_exp_avg    = stored_state["exp_avg"]
+                old_exp_avg_sq = stored_state["exp_avg_sq"]
+                # Foreground rows: preserve momentum from original fg indices
+                fg_exp_avg    = old_exp_avg[fg_mask]
+                fg_exp_avg_sq = old_exp_avg_sq[fg_mask]
+                # Background rows: zero-init (fresh points from compression)
+                bg_shape = (new_tensor.shape[0] - n_fg_pts,) + new_tensor.shape[1:]
+                bg_exp_avg    = torch.zeros(bg_shape, device="cuda", dtype=new_tensor.dtype)
+                bg_exp_avg_sq = torch.zeros(bg_shape, device="cuda", dtype=new_tensor.dtype)
+
+                new_state = {
+                    "exp_avg":    torch.cat([fg_exp_avg,    bg_exp_avg],    dim=0),
+                    "exp_avg_sq": torch.cat([fg_exp_avg_sq, bg_exp_avg_sq], dim=0),
+                    "step":       stored_state.get("step", torch.tensor(0)),
+                }
+                del gaussians.optimizer.state[old_param]
+                gaussians.optimizer.state[new_param] = new_state
+            else:
+                del gaussians.optimizer.state[old_param] if old_param in gaussians.optimizer.state else None
+
+            return {name: new_param}
+        return {}
+
+    xyz_t    = _merge_tensor_with_momentum(new_xyz,      "xyz",     n_fg_merged)
     gaussians._xyz = xyz_t["xyz"]
-    f_dc_t    = gaussians.replace_tensor_to_optimizer(new_f_dc,    "f_dc")
+    f_dc_t   = _merge_tensor_with_momentum(new_f_dc,     "f_dc",    n_fg_merged)
     gaussians._features_dc = f_dc_t["f_dc"]
-    f_rest_t  = gaussians.replace_tensor_to_optimizer(new_f_rest,  "f_rest")
+    f_rest_t = _merge_tensor_with_momentum(new_f_rest,   "f_rest",  n_fg_merged)
     gaussians._features_rest = f_rest_t["f_rest"]
-    scl_t     = gaussians.replace_tensor_to_optimizer(new_scaling,  "scaling")
+    scl_t    = _merge_tensor_with_momentum(new_scaling,  "scaling", n_fg_merged)
     gaussians._scaling = scl_t["scaling"]
-    rot_t     = gaussians.replace_tensor_to_optimizer(new_rotation,  "rotation")
+    rot_t    = _merge_tensor_with_momentum(new_rotation, "rotation",n_fg_merged)
     gaussians._rotation = rot_t["rotation"]
-    opc_t     = gaussians.replace_tensor_to_optimizer(new_opacity,  "opacity")
+    opc_t    = _merge_tensor_with_momentum(new_opacity,  "opacity", n_fg_merged)
     gaussians._opacity = opc_t["opacity"]
 
     gaussians.xyz_gradient_accum = torch.zeros((n_merged, 1), device="cuda")
