@@ -376,136 +376,115 @@ def subsampling(gaussians, ratio, random_seed=42, method='GMR'):
 
 
 def semantic_subsampling(gaussians, fg_mask, ratio, random_seed=42, method='GMR'):
-    """Split gaussians by semantic mask, compress only background, then merge back."""
+    """
+    语义感知的降采样：计算出目标总点数后，将大部分名额(例如90%)分配给前景，
+    剩余的分配给背景，然后分别使用GMR压缩并合并。
+    """
     n_total = gaussians.get_xyz.shape[0]
     n_fg = int(fg_mask.sum().item())
     n_bg = n_total - n_fg
 
-    print(f"[Semantic] foreground: {n_fg}, background: {n_bg}, total: {n_total}")
+    print(f"[Semantic] 压缩前 - 主体点数: {n_fg}, 背景点数: {n_bg}, 总计: {n_total}")
 
-    # Degenerate cases: fall back to normal subsampling
+    # 极端情况退化为标准压缩
     if n_fg == 0 or n_bg == 0:
-        print("[Semantic] Degenerate split — falling back to standard subsampling.")
+        print("[Semantic] 掩码极端失效 — 回退到标准无区分压缩")
         return subsampling(gaussians, ratio, random_seed, method)
+
+    # 1. 计算总目标点数 (Target Budget)
+    target_total = int(n_total * ratio) if ratio < 1.0 else int(ratio)
+
+    # 2. 分配预算：把 90% 的预算给主体，10% 给背景（你也可以改成 0.95 和 0.05）
+    target_fg = int(target_total * 0.90)
+    target_bg = max(1, target_total - target_fg)
+
+    # 防止分配名额超过原有点数（通常不会发生，但加上更安全）
+    target_fg = min(target_fg, n_fg)
+    target_bg = min(target_bg, n_bg)
+    n_merged = target_fg + target_bg
+
+    print(f"[Semantic] 目标分配 - 主体分配: {target_fg}, 背景分配: {target_bg}, 总计将达到: {n_merged}")
+
+    # 计算各自的压缩比率
+    ratio_fg = target_fg / n_fg
+    ratio_bg = target_bg / n_bg
 
     bg_mask = ~fg_mask
 
-    # --- Build a bare GaussianModel for background only ---
-    from scene import GaussianModel
-    bg = GaussianModel(sh_degree=gaussians.max_sh_degree)
-    with torch.no_grad():
-        bg._xyz            = gaussians._xyz[bg_mask].detach().clone()
-        bg._features_dc    = gaussians._features_dc[bg_mask].detach().clone()
-        bg._features_rest  = gaussians._features_rest[bg_mask].detach().clone()
-        bg._scaling        = gaussians._scaling[bg_mask].detach().clone()
-        bg._rotation       = gaussians._rotation[bg_mask].detach().clone()
-        bg._opacity        = gaussians._opacity[bg_mask].detach().clone()
+    # --- 辅助函数：根据掩码提取独立的 GaussianModel ---
+    def extract_submodel(mask):
+        from scene import GaussianModel
+        sub = GaussianModel(sh_degree=gaussians.max_sh_degree)
+        with torch.no_grad():
+            sub._xyz = gaussians._xyz[mask].detach().clone()
+            sub._features_dc = gaussians._features_dc[mask].detach().clone()
+            sub._features_rest = gaussians._features_rest[mask].detach().clone()
+            sub._scaling = gaussians._scaling[mask].detach().clone()
+            sub._rotation = gaussians._rotation[mask].detach().clone()
+            sub._opacity = gaussians._opacity[mask].detach().clone()
+        return sub
 
-    # --- Compress background ---
+    fg_model = extract_submodel(fg_mask)
+    bg_model = extract_submodel(bg_mask)
+
+    # --- 分别对前景和背景进行 GMR 压缩 ---
     if method == 'GMR':
-        bg_compressed = gaussian_model_reduction(bg, ratio, random_seed)
+        fg_compressed = gaussian_model_reduction(fg_model, ratio_fg, random_seed)
+        bg_compressed = gaussian_model_reduction(bg_model, ratio_bg, random_seed)
     else:
-        # Random fallback for background
-        n_keep = max(1, int(n_bg * ratio))
+        # Fallback 随机采样 (通常不会触发)
         import numpy as np
         np.random.seed(random_seed)
-        keep_idx = torch.from_numpy(
-            np.random.choice(n_bg, size=n_keep, replace=False)
-        ).to("cuda")
-        bg_compressed = GaussianModel(sh_degree=gaussians.max_sh_degree)
-        with torch.no_grad():
-            bg_compressed._xyz           = bg._xyz[keep_idx].clone()
-            bg_compressed._features_dc   = bg._features_dc[keep_idx].clone()
-            bg_compressed._features_rest = bg._features_rest[keep_idx].clone()
-            bg_compressed._scaling       = bg._scaling[keep_idx].clone()
-            bg_compressed._rotation      = bg._rotation[keep_idx].clone()
-            bg_compressed._opacity       = bg._opacity[keep_idx].clone()
-    del bg
+
+        def random_compress(model, n_keep, n_orig):
+            keep_idx = torch.from_numpy(np.random.choice(n_orig, size=n_keep, replace=False)).to("cuda")
+            for attr in ["_xyz", "_features_dc", "_features_rest", "_scaling", "_rotation", "_opacity"]:
+                setattr(model, attr, getattr(model, attr)[keep_idx])
+            return model
+
+        fg_compressed = random_compress(fg_model, target_fg, n_fg)
+        bg_compressed = random_compress(bg_model, target_bg, n_bg)
+
+    # --- 合并压缩后的张量 ---
+    with torch.no_grad():
+        new_xyz = torch.cat([fg_compressed._xyz, bg_compressed._xyz], dim=0)
+        new_f_dc = torch.cat([fg_compressed._features_dc, bg_compressed._features_dc], dim=0)
+        new_f_rest = torch.cat([fg_compressed._features_rest, bg_compressed._features_rest], dim=0)
+        new_scaling = torch.cat([fg_compressed._scaling, bg_compressed._scaling], dim=0)
+        new_rotation = torch.cat([fg_compressed._rotation, bg_compressed._rotation], dim=0)
+        new_opacity = torch.cat([fg_compressed._opacity, bg_compressed._opacity], dim=0)
+
+    # 清理中间变量释放显存
+    del fg_model, bg_model, fg_compressed, bg_compressed
     torch.cuda.empty_cache()
 
-    # --- Build merged tensors: foreground (unchanged) + compressed background ---
-    with torch.no_grad():
-        new_xyz = torch.cat([gaussians._xyz[fg_mask].detach(),
-                             bg_compressed._xyz], dim=0)
-        new_f_dc = torch.cat([gaussians._features_dc[fg_mask].detach(),
-                              bg_compressed._features_dc], dim=0)
-        new_f_rest = torch.cat([gaussians._features_rest[fg_mask].detach(),
-                                bg_compressed._features_rest], dim=0)
-        new_scaling = torch.cat([gaussians._scaling[fg_mask].detach(),
-                                 bg_compressed._scaling], dim=0)
-        new_rotation = torch.cat([gaussians._rotation[fg_mask].detach(),
-                                  bg_compressed._rotation], dim=0)
-        new_opacity = torch.cat([gaussians._opacity[fg_mask].detach(),
-                                 bg_compressed._opacity], dim=0)
-    del bg_compressed
-    torch.cuda.empty_cache()
-
-    n_merged = new_xyz.shape[0]
-    print(f"[Semantic] merged gaussians: {n_merged} (fg={n_fg} + compressed_bg={n_merged - n_fg})")
-
-    # --- Write merged tensors back into gaussians with correct Adam momentum ---
-    # replace_tensor_to_optimizer zeros out exp_avg/exp_avg_sq, which causes
-    # the optimizer to treat every merged point as brand-new and can cause
-    # transient gradient explosions. Instead, we manually stitch the momentum
-    # states: carry over foreground momentums and zero-init background ones.
-    n_fg_merged = fg_mask.sum().item()
-    with torch.no_grad():
-        # Clamp background scaling to prevent runaway stretching after compression
-        _max_scale = gaussians._scaling[fg_mask].max().detach()
-        new_scaling[n_fg_merged:] = torch.clamp(new_scaling[n_fg_merged:], max=_max_scale)
-
-    def _merge_tensor_with_momentum(new_tensor, name, n_fg_pts):
-        """Replace param in optimizer, stitching fg momentum + zero-init bg momentum."""
-        for group in gaussians.optimizer.param_groups:
-            if group["name"] != name:
-                continue
-            old_param = group['params'][0]
-            stored_state = gaussians.optimizer.state.get(old_param, None)
-
-            new_param = nn.Parameter(new_tensor.requires_grad_(True))
-            group['params'][0] = new_param
-
-            if stored_state is not None:
-                old_exp_avg    = stored_state["exp_avg"]
-                old_exp_avg_sq = stored_state["exp_avg_sq"]
-                # Foreground rows: preserve momentum from original fg indices
-                fg_exp_avg    = old_exp_avg[fg_mask]
-                fg_exp_avg_sq = old_exp_avg_sq[fg_mask]
-                # Background rows: zero-init (fresh points from compression)
-                bg_shape = (new_tensor.shape[0] - n_fg_pts,) + new_tensor.shape[1:]
-                bg_exp_avg    = torch.zeros(bg_shape, device="cuda", dtype=new_tensor.dtype)
-                bg_exp_avg_sq = torch.zeros(bg_shape, device="cuda", dtype=new_tensor.dtype)
-
-                new_state = {
-                    "exp_avg":    torch.cat([fg_exp_avg,    bg_exp_avg],    dim=0),
-                    "exp_avg_sq": torch.cat([fg_exp_avg_sq, bg_exp_avg_sq], dim=0),
-                    "step":       stored_state.get("step", torch.tensor(0)),
-                }
-                del gaussians.optimizer.state[old_param]
-                gaussians.optimizer.state[new_param] = new_state
-            else:
-                if old_param in gaussians.optimizer.state:
-                    del gaussians.optimizer.state[old_param]
-            return {name: new_param}
-        return {}
-
-    xyz_t    = _merge_tensor_with_momentum(new_xyz,      "xyz",     n_fg_merged)
+    # --- 将合并后的新张量写回优化器 ---
+    # 这里我们直接复用原版 replace_tensor_to_optimizer
+    # 它可以自动为这批全新的点重置 Adam 动量 (Momentum)，防止梯度爆炸
+    xyz_t = gaussians.replace_tensor_to_optimizer(new_xyz, "xyz")
     gaussians._xyz = xyz_t["xyz"]
-    f_dc_t   = _merge_tensor_with_momentum(new_f_dc,     "f_dc",    n_fg_merged)
+
+    f_dc_t = gaussians.replace_tensor_to_optimizer(new_f_dc, "f_dc")
     gaussians._features_dc = f_dc_t["f_dc"]
-    f_rest_t = _merge_tensor_with_momentum(new_f_rest,   "f_rest",  n_fg_merged)
+
+    f_rest_t = gaussians.replace_tensor_to_optimizer(new_f_rest, "f_rest")
     gaussians._features_rest = f_rest_t["f_rest"]
-    scl_t    = _merge_tensor_with_momentum(new_scaling,  "scaling", n_fg_merged)
+
+    scl_t = gaussians.replace_tensor_to_optimizer(new_scaling, "scaling")
     gaussians._scaling = scl_t["scaling"]
-    rot_t    = _merge_tensor_with_momentum(new_rotation, "rotation",n_fg_merged)
+
+    rot_t = gaussians.replace_tensor_to_optimizer(new_rotation, "rotation")
     gaussians._rotation = rot_t["rotation"]
-    opc_t    = _merge_tensor_with_momentum(new_opacity,  "opacity", n_fg_merged)
+
+    opc_t = gaussians.replace_tensor_to_optimizer(new_opacity, "opacity")
     gaussians._opacity = opc_t["opacity"]
 
+    # 重置渲染计数器和梯度累积器
     gaussians.xyz_gradient_accum = torch.zeros((n_merged, 1), device="cuda")
-    gaussians.denom              = torch.zeros((n_merged, 1), device="cuda")
-    gaussians.max_radii2D        = torch.zeros((n_merged,),   device="cuda")
+    gaussians.denom = torch.zeros((n_merged, 1), device="cuda")
+    gaussians.max_radii2D = torch.zeros((n_merged,), device="cuda")
 
+    print(f"[Semantic] 合并并注入优化器完成. 最终总点数: {n_merged}")
     return gaussians
 
 
