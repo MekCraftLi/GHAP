@@ -195,6 +195,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     fg_mask = get_protected_gaussian_mask(
                         gaussians, scene.getTrainCameras(), dataset.source_path
                     )
+                    # --- DEBUG: save foreground gaussians as PLY before compaction ---
+                    try:
+                        import numpy as np
+                        from plyfile import PlyData, PlyElement
+                        _g = gaussians
+                        _m = fg_mask
+                        _xyz   = _g._xyz[_m].detach().cpu().numpy()
+                        _norms = np.zeros_like(_xyz)
+                        _f_dc  = _g._features_dc[_m].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+                        _f_rest= _g._features_rest[_m].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+                        _opc   = _g._opacity[_m].detach().cpu().numpy()
+                        _scl   = _g._scaling[_m].detach().cpu().numpy()
+                        _rot   = _g._rotation[_m].detach().cpu().numpy()
+                        _attrs = np.concatenate((_xyz, _norms, _f_dc, _f_rest, _opc, _scl, _rot), axis=1)
+                        _attr_names = _g.construct_list_of_attributes()
+                        _dtype = [(a, 'f4') for a in _attr_names]
+                        _elems = np.empty(_xyz.shape[0], dtype=_dtype)
+                        _elems[:] = list(map(tuple, _attrs))
+                        _debug_path = os.path.join(scene.model_path, f"debug_foreground_{iteration}.ply")
+                        os.makedirs(os.path.dirname(_debug_path), exist_ok=True)
+                        PlyData([PlyElement.describe(_elems, 'vertex')]).write(_debug_path)
+                        print(f"[DEBUG] Saved {_m.sum().item()} foreground gaussians to {_debug_path}")
+                    except Exception as _e:
+                        print(f"[DEBUG] Could not save foreground PLY: {_e}")
+                    # --- END DEBUG ---
                     gaussians = semantic_subsampling(
                         gaussians, fg_mask, compaction.ratio[index], 42, compaction.method
                     )
