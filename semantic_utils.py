@@ -10,6 +10,7 @@
 from pathlib import Path
 import numpy as np
 import torch
+import cv2
 from PIL import Image
 
 
@@ -17,7 +18,7 @@ def get_protected_gaussian_mask(
     gaussians,
     cameras,
     dataset_path,
-    hit_threshold: int = 2,
+    hit_threshold: int = 1,
 ) -> torch.BoolTensor:
     """
     Returns a boolean tensor of shape (N,) on CUDA.
@@ -54,6 +55,9 @@ def get_protected_gaussian_mask(
 
         try:
             mask_np = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
+            # Dilate mask to cover gaussian edges that project near boundary
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+            mask_np = cv2.dilate(mask_np, kernel, iterations=1)
             mask = torch.from_numpy(mask_np).to("cuda")   # (H, W) uint8
             loaded_masks_count += 1
         except Exception as e:
@@ -103,6 +107,11 @@ def get_protected_gaussian_mask(
     del ones, xyz_h
     #torch.cuda.empty_cache()
 
-    protected = hit_counts >= hit_threshold
+    # 将原来的： protected = hit_counts >= hit_threshold
+    # 修改为根据相机数量动态计算阈值（例如 10% 的命中率）：
+    dynamic_threshold = max(hit_threshold, int(n_cams * 0.10))
+    protected = hit_counts >= dynamic_threshold
+
+    print(f"[semantic_utils] 阈值设定: >= {dynamic_threshold} 次命中")
     print(f"[semantic_utils] Protected (foreground) gaussians: {protected.sum().item()} / {N}")
     return protected
