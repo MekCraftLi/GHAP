@@ -8,6 +8,7 @@ import torchvision.transforms.functional as tf
 from tqdm import tqdm
 from argparse import ArgumentParser
 import numpy as np
+import torch.nn.functional as F
 
 # 导入 3DGS 原版指标计算函数
 from utils.loss_utils import ssim
@@ -43,16 +44,26 @@ def readImagesAndMasks(renders_dir, gt_dir, mask_dir):
     for fname in sorted(os.listdir(renders_dir)):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
+
+        render_t = tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda()
+        gt_t = tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda()
+        renders.append(render_t)
+        gts.append(gt_t)
         image_names.append(fname)
+
+        # 获取当前渲染图的尺寸 (H, W)，应对 -r 4 等降采样参数
+        _, _, H, W = render_t.shape
 
         # 加载对应的掩码
         mask_path = mask_dir / (fname.split('.')[0] + ".png")
         if mask_path.exists():
             mask_np = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
-            mask_t = torch.from_numpy(mask_np).to("cuda") > 127
-            masks.append(mask_t.unsqueeze(0).unsqueeze(0))  # [1, 1, H, W]
+            mask_t = torch.from_numpy(mask_np).to("cuda").float() / 255.0
+            mask_t = mask_t.unsqueeze(0).unsqueeze(0)  # [1, 1, H_orig, W_orig]
+
+            # 使用最近邻插值(nearest)将掩码缩放到与渲染图一致的尺寸
+            mask_resized = F.interpolate(mask_t, size=(H, W), mode='nearest') > 0.5
+            masks.append(mask_resized)
         else:
             masks.append(None)
 
@@ -71,7 +82,7 @@ def evaluate_comprehensive(model_paths, source_path):
         try:
             print(f"\n[评估场景]: {scene_dir}")
             full_dict[scene_dir] = {}
-            test_dir = Path(scene_dir) / "test"
+            test_dir = Path(scene_dir) / "train"
 
             for method in os.listdir(test_dir):
                 print(f"[{method}] 读取图像中...")
